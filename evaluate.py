@@ -18,6 +18,7 @@ from config import (
     PGD_EPSILON,
     PGD_ALPHA,
     PGD_STEPS,
+    DECISION_THRESHOLD,
 )
 
 def evaluate_model(model_path="runs/afsl_epoch_6.pth", adversarial=False):
@@ -38,24 +39,24 @@ def evaluate_model(model_path="runs/afsl_epoch_6.pth", adversarial=False):
     print(f"Evaluating model: {model_path} ({attack_type})")
     print(f"Test dataset size: {len(test_dataset)}")
 
-    with torch.no_grad():
-        for images, labels, _ in test_loader:
-            images = images.to(DEVICE)
-            labels = labels.to(DEVICE)
+    for images, labels, _ in test_loader:
+        images = images.to(DEVICE)
+        labels = labels.to(DEVICE)
 
-            if adversarial:
-                # Generate adversarial images
-                images = pgd_attack(
-                    model,
-                    images,
-                    labels,
-                    epsilon=PGD_EPSILON,
-                    alpha=PGD_ALPHA,
-                    steps=PGD_STEPS
-                )
+        if adversarial:
+            # PGD needs gradients — must be OUTSIDE no_grad()
+            images = pgd_attack(
+                model,
+                images,
+                labels,
+                epsilon=PGD_EPSILON,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS
+            )
 
+        with torch.no_grad():
             _, logits = model(images)
-            preds = (torch.sigmoid(logits.squeeze()) > 0.6).int()  # Threshold at 0.6 earlier 0.5
+            preds = (torch.sigmoid(logits.squeeze()) > DECISION_THRESHOLD).int()
 
             all_preds.extend(preds.cpu().numpy().flatten())
             all_labels.extend(labels.cpu().numpy().flatten())

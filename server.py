@@ -1,5 +1,6 @@
 """
 FastAPI server for deepfake detection using AFSL and Baseline models.
+Also provides a privacy filter using the Carlini-Wagner L2 attack.
 Run with: uvicorn server:app --reload --port 8000
 """
 
@@ -7,8 +8,10 @@ import sys
 import base64
 import io
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
+from contextlib import asynccontextmanager
 
+import cv2
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -16,21 +19,29 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from mtcnn import MTCNN
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT))
 
 from models.detector import Detector
-from config import DEVICE, RUNS_DIR, IMAGE_SIZE, NORM_MEAN, NORM_STD
+from config import DEVICE, RUNS_DIR, IMAGE_SIZE, NORM_MEAN, NORM_STD, DECISION_THRESHOLD
 from torchvision import transforms
 
 # ============== App Setup ==============
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load models and face detector when server starts."""
+    load_models()
+    yield
+
 app = FastAPI(
     title="Deepfake Detection API",
     description="API for detecting deepfakes using AFSL and Baseline models",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS middleware to allow requests from Next.js frontend
@@ -53,15 +64,22 @@ BASELINE_MODEL_PATH = RUNS_DIR / "tinker_baseline_epoch_5.pth"
 AFSL_MODEL_PATH = RUNS_DIR / "afsl_epoch_6.pth"
 
 # Global model instances
+face_detector = None
 baseline_model = None
 afsl_model = None
+ensemble_model = None  # For privacy filter
 
 
 def load_models():
-    """Load both models into memory."""
-    global baseline_model, afsl_model
+    """Load both models, face detector, and ensemble for privacy filter."""
+    global baseline_model, afsl_model, face_detector, ensemble_model
     
     print(f"Loading models on device: {DEVICE}")
+    
+    # Load MTCNN face detector
+    print("Loading MTCNN face detector...")
+    face_detector = MTCNN()
+    print("✓ MTCNN face detector loaded")
     
     # Load Baseline model
     print(f"Loading Baseline model from: {BASELINE_MODEL_PATH}")
@@ -78,6 +96,12 @@ def load_models():
     afsl_model.to(DEVICE)
     afsl_model.eval()
     print("✓ AFSL model loaded")
+    
+    # Load ensemble feature extractors for privacy filter
+    print("Loading ensemble feature extractors (ResNet-50, VGG-16, DenseNet-121)...")
+    from attacks.cw import EnsembleFeatureExtractor
+    ensemble_model = EnsembleFeatureExtractor(device=DEVICE)
+    print("✓ Ensemble feature extractors loaded")
 
 
 # ============== Image Processing ==============
@@ -91,6 +115,8 @@ def get_inference_transforms():
     ])
 
 
+MAX_IMAGE_SIZE_MB = 10
+
 def decode_base64_image(base64_string: str) -> Image.Image:
     """Decode a base64 image string to PIL Image."""
     # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,")
@@ -98,8 +124,47 @@ def decode_base64_image(base64_string: str) -> Image.Image:
         base64_string = base64_string.split(",", 1)[1]
     
     image_bytes = base64.b64decode(base64_string)
+    
+    # Reject images larger than MAX_IMAGE_SIZE_MB
+    size_mb = len(image_bytes) / (1024 * 1024)
+    if size_mb > MAX_IMAGE_SIZE_MB:
+        raise ValueError(f"Image too large ({size_mb:.1f} MB). Maximum is {MAX_IMAGE_SIZE_MB} MB.")
+    
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return image
+
+
+def extract_face(image: Image.Image) -> Optional[Image.Image]:
+    """
+    Detect and crop the largest face from a PIL Image using MTCNN.
+    Returns the cropped face as a PIL Image, or None if no face is found.
+    This matches the training preprocessing (tools/face_preprocess.py).
+    """
+    rgb_array = np.array(image)
+    
+    try:
+        detections = face_detector.detect_faces(rgb_array)
+    except Exception:
+        return None
+    
+    if not detections:
+        return None
+    
+    # Pick the largest face (same logic as face_preprocess.py)
+    largest = max(detections, key=lambda d: d["box"][2] * d["box"][3])
+    x, y, w, h = largest["box"]
+    
+    # Clamp to image boundaries
+    x, y = max(0, x), max(0, y)
+    x2 = min(x + w, rgb_array.shape[1])
+    y2 = min(y + h, rgb_array.shape[0])
+    
+    face_crop = rgb_array[y:y2, x:x2]
+    
+    if face_crop.size == 0:
+        return None
+    
+    return Image.fromarray(face_crop)
 
 
 def predict(model: torch.nn.Module, image: Image.Image) -> dict:
@@ -111,8 +176,8 @@ def predict(model: torch.nn.Module, image: Image.Image) -> dict:
         _, logits = model(img_tensor)
         probability = torch.sigmoid(logits).item()
     
-    # Label: 1 = Real, 0 = Fake (threshold 0.6 as per evaluate.py)
-    is_real = probability > 0.6
+    # Label: 1 = Real, 0 = Fake
+    is_real = probability > DECISION_THRESHOLD
     
     # Confidence is how sure the model is of its prediction
     confidence = probability if is_real else (1 - probability)
@@ -151,15 +216,15 @@ def pil_to_tensor(image: Image.Image) -> torch.Tensor:
 def fgsm_attack(model: torch.nn.Module, image_tensor: torch.Tensor, epsilon: float) -> torch.Tensor:
     """
     Fast Gradient Sign Method (FGSM) attack.
-    Tries to flip the prediction by adding perturbation in the gradient direction.
+    Flips the prediction by maximizing loss against the opposite of current prediction.
     """
     model.eval()
     image_tensor = image_tensor.clone().detach().requires_grad_(True)
     
     _, logits = model(image_tensor)
-    # Use current prediction as target (attack wants to flip it)
     prob = torch.sigmoid(logits)
-    target = (prob > 0.5).float()
+    # Flip the prediction to create a target that maximizes loss
+    target = 1.0 - (prob > 0.5).float()
     
     loss = F.binary_cross_entropy_with_logits(logits.view(-1), target.view(-1))
     loss.backward()
@@ -176,6 +241,7 @@ def pgd_attack_adversarial(model: torch.nn.Module, image_tensor: torch.Tensor,
                            epsilon: float, alpha: float = None, steps: int = 10) -> torch.Tensor:
     """
     Projected Gradient Descent (PGD) attack - iterative FGSM.
+    Determines flipped target once, then iterates to maximize loss.
     """
     if alpha is None:
         alpha = epsilon / 4
@@ -184,11 +250,14 @@ def pgd_attack_adversarial(model: torch.nn.Module, image_tensor: torch.Tensor,
     original = image_tensor.clone().detach()
     perturbed = image_tensor.clone().detach()
     
+    # Determine target once (flip original prediction)
+    with torch.no_grad():
+        _, logits_orig = model(original)
+        target = 1.0 - (torch.sigmoid(logits_orig) > 0.5).float()
+    
     for _ in range(steps):
         perturbed.requires_grad_(True)
         _, logits = model(perturbed)
-        prob = torch.sigmoid(logits)
-        target = (prob > 0.5).float()
         
         loss = F.binary_cross_entropy_with_logits(logits.view(-1), target.view(-1))
         grad = torch.autograd.grad(loss, perturbed)[0]
@@ -234,12 +303,9 @@ class PredictionResult(BaseModel):
 class PredictResponse(BaseModel):
     baseline: PredictionResult
     afsl: PredictionResult
+    face_detected: bool
+    cropped_face: Optional[str] = None  # Base64 encoded cropped face
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Load models when server starts."""
-    load_models()
 
 
 @app.get("/")
@@ -259,6 +325,7 @@ async def root():
 async def predict_endpoint(request: PredictRequest):
     """
     Predict if an image is real or fake using both models.
+    Extracts the face from the image first (matching training preprocessing).
     
     Args:
         request: JSON body with base64-encoded image
@@ -272,13 +339,24 @@ async def predict_endpoint(request: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
     
-    # Run predictions
-    baseline_result = predict(baseline_model, image)
-    afsl_result = predict(afsl_model, image)
+    # Extract face from the image (matches training pipeline)
+    face_image = extract_face(image)
+    
+    if face_image is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No face detected in the image. Please upload an image containing a clearly visible face."
+        )
+    
+    # Run predictions on the cropped face
+    baseline_result = predict(baseline_model, face_image)
+    afsl_result = predict(afsl_model, face_image)
     
     return {
         "baseline": baseline_result,
-        "afsl": afsl_result
+        "afsl": afsl_result,
+        "face_detected": True,
+        "cropped_face": encode_image_base64(face_image),
     }
 
 
@@ -304,6 +382,7 @@ class AdversarialResponse(BaseModel):
 async def adversarial_endpoint(request: AdversarialRequest):
     """
     Generate an adversarial image and compare model predictions.
+    Extracts the face first, then applies attacks to the cropped face.
     
     Args:
         request: JSON body with base64-encoded image, attack_type, and epsilon
@@ -317,20 +396,29 @@ async def adversarial_endpoint(request: AdversarialRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
     
-    # Get predictions on original image
-    baseline_original = predict(baseline_model, original_image)
-    afsl_original = predict(afsl_model, original_image)
+    # Extract face from the image (matches training pipeline)
+    face_image = extract_face(original_image)
     
-    # Generate adversarial image based on attack type
+    if face_image is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No face detected in the image. Please upload an image containing a clearly visible face."
+        )
+    
+    # Get predictions on original face crop
+    baseline_original = predict(baseline_model, face_image)
+    afsl_original = predict(afsl_model, face_image)
+    
+    # Generate adversarial image based on attack type (on the face crop)
     attack_type = request.attack_type
     epsilon = request.epsilon
     
     if attack_type == "blur":
         # Blur attack works directly on PIL image
-        adversarial_image = blur_attack(original_image, epsilon)
+        adversarial_image = blur_attack(face_image, epsilon)
     else:
-        # Convert to tensor for gradient-based attacks
-        image_tensor = pil_to_tensor(original_image)
+        # Convert face crop to tensor for gradient-based attacks
+        image_tensor = pil_to_tensor(face_image)
         
         if attack_type == "fgsm":
             perturbed_tensor = fgsm_attack(baseline_model, image_tensor, epsilon)
@@ -362,6 +450,142 @@ async def adversarial_endpoint(request: AdversarialRequest):
             "adversarial": afsl_adversarial
         }
     }
+
+# ============== Privacy Filter (Ensemble Transferable Attack) ==============
+
+import json
+import asyncio
+import threading
+from fastapi.responses import StreamingResponse
+from attacks.cw import privacy_attack
+
+# Strength presets: tuned for smooth, imperceptible perturbation.
+# Gradient smoothing keeps noise natural; lower TV weight preserves attack power.
+STRENGTH_PRESETS = {
+    "low":    {"epsilon": 4/255,  "num_iterations": 100, "alpha": 0.3/255,
+               "momentum": 0.9, "tv_weight": 0.15, "smooth_sigma": 1.5,
+               "smooth_kernel": 7, "use_input_diversity": True},
+    "medium": {"epsilon": 8/255,  "num_iterations": 150, "alpha": 0.4/255,
+               "momentum": 0.9, "tv_weight": 0.1, "smooth_sigma": 1.5,
+               "smooth_kernel": 7, "use_input_diversity": True},
+    "high":   {"epsilon": 12/255, "num_iterations": 200, "alpha": 0.5/255,
+               "momentum": 0.9, "tv_weight": 0.08, "smooth_sigma": 1.0,
+               "smooth_kernel": 5, "use_input_diversity": True},
+}
+
+
+class PrivacyFilterRequest(BaseModel):
+    image: str  # Base64 encoded image
+    strength: Literal["low", "medium", "high"] = "medium"
+
+
+@app.post("/api/privacy-filter")
+async def privacy_filter_endpoint(request: PrivacyFilterRequest):
+    """
+    Apply a transferable ensemble adversarial attack to protect an image
+    from reverse image search and face-recognition systems.
+
+    Uses ResNet-50 + VGG-16 + DenseNet-121 ensemble with input diversity
+    and momentum for maximum transferability to unknown models.
+
+    Returns an SSE stream with progress events and a final result event.
+    """
+    try:
+        image = decode_base64_image(request.image)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
+
+    original_size = image.size  # (width, height) — preserve for later
+
+    # Resize to 224×224 for the ensemble models
+    image_tensor = pil_to_tensor(image)  # (1, 3, 224, 224) in [0, 1]
+
+    params = STRENGTH_PRESETS[request.strength]
+
+    # --- SSE streaming with real progress ---
+    progress_queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+    result_holder = {}
+
+    def progress_callback(current, total, info):
+        """Called by the attack from the worker thread."""
+        pct = min(round(current / total * 100), 100)
+        asyncio.run_coroutine_threadsafe(
+            progress_queue.put({
+                "type": "progress",
+                "percent": pct,
+                "cos_sim": info.get("cos_sim"),
+                "l2": info.get("l2"),
+                "step": f"Iteration {info.get('iteration')}",
+            }),
+            loop,
+        )
+
+    def run_attack():
+        """Run the ensemble attack (blocking) in a worker thread."""
+        try:
+            protected_tensor, stats = privacy_attack(
+                ensemble=ensemble_model,
+                image_tensor=image_tensor,
+                progress_callback=progress_callback,
+                **params,
+            )
+
+            # --- Preserve original aspect ratio ---
+            with torch.no_grad():
+                delta_224 = protected_tensor - image_tensor
+
+                orig_h, orig_w = original_size[1], original_size[0]
+                delta_full = torch.nn.functional.interpolate(
+                    delta_224,
+                    size=(orig_h, orig_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                original_full = np.array(image).astype(np.float32) / 255.0
+                original_full_t = torch.from_numpy(original_full).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+                protected_full_t = torch.clamp(original_full_t + delta_full, 0, 1)
+
+                protected_array = (protected_full_t.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                protected_pil = Image.fromarray(protected_array)
+
+            result_holder["result"] = {
+                "protected_image": encode_image_base64(protected_pil),
+                "l2_distance": round(stats["l2_distance"], 4),
+                "original_similarity": stats["cos_sim_orig"],
+                "protected_similarity": round(stats["cos_sim_adv"], 4),
+            }
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            result_holder["error"] = str(exc)
+
+        asyncio.run_coroutine_threadsafe(progress_queue.put(None), loop)
+
+    thread = threading.Thread(target=run_attack, daemon=True)
+    thread.start()
+
+    async def event_stream():
+        while True:
+            msg = await progress_queue.get()
+            if msg is None:
+                if "error" in result_holder:
+                    yield f"data: {json.dumps({'type': 'error', 'detail': result_holder['error']})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'result', **result_holder['result']})}\n\n"
+                break
+            yield f"data: {json.dumps(msg)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ============== Run Server ==============

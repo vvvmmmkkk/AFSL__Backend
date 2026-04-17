@@ -23,8 +23,9 @@ def pgd_attack(model, images, labels, epsilon=8/255, alpha=2/255, steps=10):
         grad = torch.autograd.grad(loss, images_adv)[0]
         images_adv = images_adv + alpha * grad.sign()
 
+        # Project onto epsilon-ball only (no [0,1] clamp for normalized inputs)
         eta = torch.clamp(images_adv - images, -epsilon, epsilon)
-        images_adv = torch.clamp(images + eta, 0, 1).detach().requires_grad_(True)
+        images_adv = (images + eta).detach().requires_grad_(True)
 
     if was_training:
         model.train()
