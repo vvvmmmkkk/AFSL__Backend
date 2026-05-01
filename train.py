@@ -34,8 +34,11 @@ AFSL_EPOCHS = 1
 
 # -----------------------------
 # SRL LOSS (real–fake pairing)
+# Penalises HIGH similarity between real and fake features
+# (pushes them apart to preserve inter-class separation)
+# L_SRL = max(0, sim(real, fake) - margin)
 # -----------------------------
-def similarity_regularization_loss(features, labels, video_ids):
+def similarity_regularization_loss(features, labels, video_ids, margin=0.3):
     device = features.device
     loss = torch.tensor(0.0, device=device)
     count = 0
@@ -54,10 +57,12 @@ def similarity_regularization_loss(features, labels, video_ids):
             continue
 
         i, j = real_idxs[0], fake_idxs[0]
-        loss += 1 - F.cosine_similarity(
+        sim = F.cosine_similarity(
             features[i].unsqueeze(0),
             features[j].unsqueeze(0)
         )
+        # Penalise when similarity EXCEEDS margin (push apart)
+        loss += torch.clamp(sim - margin, min=0.0)
         count += 1
 
     return loss / count if count > 0 else loss
@@ -108,29 +113,27 @@ def train():
             images = images.to(device)
             labels = labels.to(device)
 
-            # Generate adversarial images first (keep attack independent)
-            images_adv = pgd_attack(
-                model,
-                images,
-                labels,
-                epsilon=PGD_EPSILON,
-                alpha=PGD_ALPHA,
-                steps=PGD_STEPS
-            )
-
-            # Compute features and logits for AFSL
-            features, logits = model(images)
-
-            features_adv, _ = model(images_adv)
-
-            # Losses
-            # 1. Classification loss
-            loss_cls = F.binary_cross_entropy_with_logits(
-                logits.view(-1),
-                labels.float().view(-1)
-            )
-
             if MODE == "afsl":
+                # Generate adversarial images for AFSL training
+                images_adv = pgd_attack(
+                    model,
+                    images,
+                    labels,
+                    epsilon=PGD_EPSILON,
+                    alpha=PGD_ALPHA,
+                    steps=PGD_STEPS
+                )
+
+                # Compute features and logits
+                features, logits = model(images)
+                features_adv, _ = model(images_adv)
+
+                # 1. Classification loss
+                loss_cls = F.binary_cross_entropy_with_logits(
+                    logits.view(-1),
+                    labels.float().view(-1)
+                )
+
                 # 2. Adversarial Feature Similarity Loss (ASL)
                 loss_asl = 1 - F.cosine_similarity(
                     features,
@@ -147,6 +150,13 @@ def train():
 
                 # total AFSL loss
                 loss = loss_cls + lambda_asl * loss_asl + lambda_srl * loss_srl
+            else:
+                # Baseline: classification loss only on clean images
+                _, logits = model(images)
+                loss = F.binary_cross_entropy_with_logits(
+                    logits.view(-1),
+                    labels.float().view(-1)
+                )
 
             # Backprop
             optimizer.zero_grad()

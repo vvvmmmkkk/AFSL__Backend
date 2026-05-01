@@ -23,6 +23,10 @@ FACES_DIR = DATA_DIR / "faces"
 CATALOG_CSV = Path(os.environ.get("CATALOG_CSV", DATA_DIR / "catalog.csv"))
 
 # Image / training settings
+# NOTE: The values below are LOCAL DEV/DEBUG overrides.
+# Production training was conducted on a separate machine (RTX A4000)
+# with: BATCH_SIZE=8, PGD_STEPS=5, PGD_EPSILON=8/255, EPOCHS=11.
+# See the project report for production training configuration.
 IMAGE_SIZE = 224
 
 # BATCH_SIZE = 2
@@ -46,3 +50,7 @@ PGD_STEPS = 1
 
 RUNS_DIR = PROJECT_ROOT / "runs"
 CHECKPOINTS_DIR = RUNS_DIR / "checkpoints"
+
+# Decision threshold for binary classification
+# 0.65 reduces false positives; tuned for forensic applications
+DECISION_THRESHOLD = 0.65

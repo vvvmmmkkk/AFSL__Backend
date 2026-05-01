@@ -1,0 +1,9 @@
+{
+  "pythonVersion": "3.13",
+  "pythonPlatform": "Windows",
+  "extraPaths": [
+    "C:\\Users\\Asininite\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages"
+  ],
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false
+}
